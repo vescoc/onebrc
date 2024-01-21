@@ -1,49 +1,43 @@
 #![deny(clippy::pedantic)]
 
 use std::collections::HashMap;
-use std::{fmt, ops, str, thread};
+use std::{fmt, ops, str, sync::mpsc, thread};
 
 /// Run
 ///
 /// # Panics
 /// Panic if invalid input
-pub fn run_filter<F, const S: usize>(
-    input: &str,
-    f: impl Fn(&str) -> bool,
-) -> impl Iterator<Item = (&str, (u16, F, F, F))>
+fn map_phase<'a, F, const S: usize>(
+    lines: impl Iterator<Item = &'a str>,
+) -> HashMap<&'a str, (u16, F, F, F)>
 where
     F: str::FromStr,
     <F as str::FromStr>::Err: fmt::Debug,
     F: PartialOrd,
     F: Copy,
     F: ops::AddAssign,
-    F: ops::Div<Output = F>,
     F: From<u16>,
 {
     let mut map = HashMap::with_capacity(S);
-    for line in input.lines() {
+    for line in lines {
         if let Some((location, value)) = line.split_once(';') {
-            if f(location) {
-                let value = value.parse::<F>().expect("invalid input");
-                map.entry(location)
-                    .and_modify(|(count, min, max, total)| {
-                        *count += 1;
-                        if *min > value {
-                            *min = value;
-                        }
-                        if *max < value {
-                            *max = value;
-                        }
-                        *total += value;
-                    })
-                    .or_insert((1, value, value, value));
-            }
+            let value = value.parse::<F>().expect("invalid input");
+            map.entry(location)
+                .and_modify(|(count, min, max, total)| {
+                    *count += 1;
+                    if *min > value {
+                        *min = value;
+                    }
+                    if *max < value {
+                        *max = value;
+                    }
+                    *total += value;
+                })
+                .or_insert((1, value, value, value));
         }
     }
 
-    map.into_iter().map(|(location, (count, min, max, total))| {
-        (location, (count, min, max, total / F::from(count)))
-    })
+    map
 }
 
 pub fn run<F>(input: &str) -> impl Iterator<Item = (&str, (u16, F, F, F))>
@@ -56,7 +50,11 @@ where
     F: ops::Div<Output = F>,
     F: From<u16>,
 {
-    run_filter::<_, 50_000>(input, |_| true)
+    map_phase::<_, 50_000>(input.lines())
+        .into_iter()
+        .map(|(location, (count, min, max, total))| {
+            (location, (count, min, max, total / F::from(count)))
+        })
 }
 
 /// Run
@@ -74,19 +72,72 @@ where
     F: From<u16>,
     F: Send,
 {
-    const SIZE: usize = 50_000;
+    const BATCH_SIZE: usize = 1_024 * 20;
 
-    // ABCDEFGHIJKLMNOPQRSTUVWXYZ
+    let (out_tx, out_rx) = mpsc::channel();
     thread::scope(|s| {
-        let h_0 = s.spawn(|| run_filter::<_, SIZE>(input, |location| location < "F"));
-        let h_1 =
-            s.spawn(|| run_filter::<_, SIZE>(input, |location| ("F".."M").contains(&location)));
-        let h_2 =
-            s.spawn(|| run_filter::<_, SIZE>(input, |location| ("M".."U").contains(&location)));
+        let workers = (0..thread::available_parallelism().unwrap().get())
+            .map(|_i| {
+                let (in_tx, in_rx) = mpsc::channel();
+                let out_tx = out_tx.clone();
+                (
+                    in_tx,
+                    s.spawn(move || {
+                        while let Ok(lines) = in_rx.recv() {
+                            let result = map_phase::<_, 50_000>(lines);
+                            if result.is_empty() {
+                                break;
+                            }
+                            out_tx.send(result).unwrap();
+                        }
+                    }),
+                )
+            })
+            .collect::<Vec<_>>();
+        drop(out_tx);
 
-        run_filter::<_, SIZE>(input, |location| location >= "U")
-            .chain(h_0.join().unwrap())
-            .chain(h_1.join().unwrap())
-            .chain(h_2.join().unwrap())
+        let mut current_worker = 0;
+        let mut lines = input.lines();
+        loop {
+            let work = lines.clone();
+            workers[current_worker]
+                .0
+                .send(work.take(BATCH_SIZE))
+                .unwrap();
+            if lines.nth(BATCH_SIZE).is_some() {
+                current_worker = (current_worker + 1) % workers.len();
+            } else {
+                break;
+            }
+        }
+
+        for (i, _) in workers {
+            i.send(lines.clone().take(0)).ok();
+        }
+
+        let mut result: HashMap<&str, (u16, F, F, F)> = HashMap::with_capacity(50_000);
+        while let Ok(worker_result) = out_rx.recv() {
+            for (location, (count, min, max, total)) in worker_result {
+                result
+                    .entry(location)
+                    .and_modify(|(w_count, w_min, w_max, w_total)| {
+                        *w_count += count;
+                        if min < *w_min {
+                            *w_min = min;
+                        }
+                        if max > *w_max {
+                            *w_max = max;
+                        }
+                        *w_total += total;
+                    })
+                    .or_insert((count, min, max, total));
+            }
+        }
+
+        result
+            .into_iter()
+            .map(|(location, (count, min, max, total))| {
+                (location, (count, min, max, total / F::from(count)))
+            })
     })
 }
